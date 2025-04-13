@@ -22,7 +22,7 @@ const mailSender = async (email, title, body, attachmentPath = null, attachmentN
 
         // Prepare mail options
         let mailOptions = {
-            from: `"Ayush" <${process.env.MAIL_USER}>`,
+            from: `"Ankit" <${process.env.MAIL_USER}>`,
             to: email,
             subject: title,
             html: body,
