@@ -24,14 +24,12 @@ mongoose.connect('mongodb+srv://as7235740:nh4ohtdJdEcpalam@cluster0.aal4w.mongod
 .catch(err => console.error('MongoDB connection error:', err));
 
 // Define Schema for Spreadsheets
-
 const columnSchema = new mongoose.Schema({
-    name: String,
-    locked: { type: Boolean, default: false },
-    type: { type: String, default: 'text' }, // text, number, date, dropdown, checkbox
-    options: [String] // For dropdown type
-  });
-  
+  name: String,
+  locked: { type: Boolean, default: false },
+  type: { type: String, default: 'text' }, // text, number, date, dropdown, checkbox
+  options: [String] // For dropdown type
+});
 
 const spreadsheetSchema = new mongoose.Schema({
   name: { type: String, required: true },
@@ -40,8 +38,6 @@ const spreadsheetSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now },
   updatedAt: { type: Date, default: Date.now },
 });
-
-
 
 const Spreadsheet = mongoose.model('Spreadsheet', spreadsheetSchema);
 
@@ -64,53 +60,71 @@ const upload = multer({
   limits: { fileSize: 100 * 1024 * 1024 } // 100MB limit
 });
 
+// Helper function to retry operations that may encounter version conflicts
+async function retryOperation(operation, maxRetries = 3) {
+  let retries = 0;
+  while (retries < maxRetries) {
+    try {
+      return await operation();
+    } catch (error) {
+      if (error.name === 'VersionError' && retries < maxRetries - 1) {
+        retries++;
+        await new Promise(resolve => setTimeout(resolve, 100)); // Small delay before retry
+        continue;
+      }
+      throw error;
+    }
+  }
+}
+
 // Routes
 app.get('/api/spreadsheets/:id/download', async (req, res) => {
-    try {
-      const { id } = req.params;
-      
-      // Get spreadsheet data
-      const spreadsheet = await Spreadsheet.findById(id);
-      
-      if (!spreadsheet) {
-        return res.status(404).json({ error: 'Spreadsheet not found' });
-      }
-      
-      // Create a new workbook
-      const workbook = XLSX.utils.book_new();
-      
-      // Convert data to format expected by xlsx
-      const headers = spreadsheet.columns.map(col => col.name);
-      
-      // Create worksheet data with headers as first row
-      const worksheetData = [headers];
-      
-      // Add all the data rows
-      spreadsheet.data.forEach(row => {
-        const rowData = headers.map(header => row[header] || null);
-        worksheetData.push(rowData);
-      });
-      
-      // Create worksheet
-      const worksheet = XLSX.utils.aoa_to_sheet(worksheetData);
-      
-      // Add worksheet to workbook
-      XLSX.utils.book_append_sheet(workbook, worksheet, 'Sheet1');
-      
-      // Generate buffer
-      const excelBuffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
-      
-      // Set headers for file download
-      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-      res.setHeader('Content-Disposition', `attachment; filename="${spreadsheet.name}.xlsx"`);
-      
-      // Send the file
-      res.send(excelBuffer);
-    } catch (error) {
-      console.error('Error downloading spreadsheet:', error);
-      res.status(500).json({ error: 'Error downloading spreadsheet', details: error.message });
+  try {
+    const { id } = req.params;
+    
+    // Get spreadsheet data
+    const spreadsheet = await Spreadsheet.findById(id);
+    
+    if (!spreadsheet) {
+      return res.status(404).json({ error: 'Spreadsheet not found' });
     }
-  });
+    
+    // Create a new workbook
+    const workbook = XLSX.utils.book_new();
+    
+    // Convert data to format expected by xlsx
+    const headers = spreadsheet.columns.map(col => col.name);
+    
+    // Create worksheet data with headers as first row
+    const worksheetData = [headers];
+    
+    // Add all the data rows
+    spreadsheet.data.forEach(row => {
+      const rowData = headers.map(header => row[header] || null);
+      worksheetData.push(rowData);
+    });
+    
+    // Create worksheet
+    const worksheet = XLSX.utils.aoa_to_sheet(worksheetData);
+    
+    // Add worksheet to workbook
+    XLSX.utils.book_append_sheet(workbook, worksheet, 'Sheet1');
+    
+    // Generate buffer
+    const excelBuffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
+    
+    // Set headers for file download
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="${spreadsheet.name}.xlsx"`);
+    
+    // Send the file
+    res.send(excelBuffer);
+  } catch (error) {
+    console.error('Error downloading spreadsheet:', error);
+    res.status(500).json({ error: 'Error downloading spreadsheet', details: error.message });
+  }
+});
+
 // Upload and parse file
 app.post('/api/upload', upload.single('file'), async (req, res) => {
   try {
@@ -225,7 +239,7 @@ app.get('/api/spreadsheets/:id', async (req, res) => {
   }
 });
 
-// Update cell data (batch update)
+// Update cell data (batch update) - FIXED VERSION
 app.put('/api/spreadsheets/:id/data', async (req, res) => {
   try {
     const { id } = req.params;
@@ -235,8 +249,8 @@ app.put('/api/spreadsheets/:id/data', async (req, res) => {
       return res.status(400).json({ error: 'Updates must be an array' });
     }
 
+    // First, get the spreadsheet to check locked columns
     const spreadsheet = await Spreadsheet.findById(id);
-
     if (!spreadsheet) {
       return res.status(404).json({ error: 'Spreadsheet not found' });
     }
@@ -252,22 +266,38 @@ app.put('/api/spreadsheets/:id/data', async (req, res) => {
       }
     }
 
-    // Apply updates to the data array
-    for (const update of updates) {
-      if (spreadsheet.data[update.rowIndex]) {
-        spreadsheet.data[update.rowIndex][update.field] = update.value;
-      }
-    }
+    // Process updates using MongoDB's atomic operators
+    const bulkOperations = updates.map(update => {
+      const updatePath = `data.${update.rowIndex}.${update.field}`;
+      return {
+        updateOne: {
+          filter: { _id: id },
+          update: { 
+            $set: { [updatePath]: update.value, updatedAt: new Date() }
+          }
+        }
+      };
+    });
 
-    // Mark data field as modified
-    spreadsheet.markModified('data');
+    // Execute the bulk operations
+    await Spreadsheet.bulkWrite(bulkOperations);
 
-    spreadsheet.updatedAt = new Date();
-    const savedSpreadsheet = await spreadsheet.save();
-
-    res.json({ success: true, spreadsheet: savedSpreadsheet });
+    // Get the updated document
+    const updatedSpreadsheet = await Spreadsheet.findById(id);
+    
+    res.json({ success: true, spreadsheet: updatedSpreadsheet });
   } catch (error) {
     console.error('Error updating data:', error);
+    
+    // Specific handling for version errors
+    if (error.name === 'VersionError') {
+      return res.status(409).json({ 
+        error: 'Conflict detected, the document was modified by another request',
+        details: 'Try again with the latest version of the data',
+        code: 'VERSION_CONFLICT'
+      });
+    }
+    
     res.status(500).json({ error: 'Error updating data', details: error.message });
   }
 });
@@ -278,23 +308,28 @@ app.put('/api/spreadsheets/:id/columns/:columnName/lock', async (req, res) => {
     const { id, columnName } = req.params;
     const { locked } = req.body;
     
-    const spreadsheet = await Spreadsheet.findById(id);
+    // Use findOneAndUpdate to avoid version conflicts
+    const result = await Spreadsheet.findOneAndUpdate(
+      { 
+        _id: id,
+        'columns.name': columnName 
+      },
+      { 
+        $set: { 
+          'columns.$.locked': locked,
+          updatedAt: new Date()
+        } 
+      },
+      { new: true }
+    );
     
-    if (!spreadsheet) {
-      return res.status(404).json({ error: 'Spreadsheet not found' });
+    if (!result) {
+      return res.status(404).json({ error: 'Spreadsheet or column not found' });
     }
     
-    const columnIndex = spreadsheet.columns.findIndex(col => col.name === columnName);
+    const updatedColumn = result.columns.find(col => col.name === columnName);
     
-    if (columnIndex === -1) {
-      return res.status(404).json({ error: 'Column not found' });
-    }
-    
-    spreadsheet.columns[columnIndex].locked = locked;
-    spreadsheet.updatedAt = new Date();
-    await spreadsheet.save();
-    
-    res.json({ success: true, column: spreadsheet.columns[columnIndex] });
+    res.json({ success: true, column: updatedColumn });
   } catch (error) {
     console.error('Error updating column lock status:', error);
     res.status(500).json({ error: 'Error updating column lock status', details: error.message });
@@ -307,19 +342,23 @@ app.post('/api/spreadsheets/:id/row', async (req, res) => {
     const { id } = req.params;
     const rowData = req.body;
     
-    const spreadsheet = await Spreadsheet.findById(id);
+    // Use findOneAndUpdate to avoid version conflicts
+    const result = await Spreadsheet.findByIdAndUpdate(
+      id,
+      { 
+        $push: { data: rowData },
+        $set: { updatedAt: new Date() }
+      },
+      { new: true }
+    );
     
-    if (!spreadsheet) {
+    if (!result) {
       return res.status(404).json({ error: 'Spreadsheet not found' });
     }
     
-    spreadsheet.data.push(rowData);
-    spreadsheet.updatedAt = new Date();
-    await spreadsheet.save();
-    
     res.json({ 
       success: true, 
-      rowIndex: spreadsheet.data.length - 1,
+      rowIndex: result.data.length - 1,
       row: rowData
     });
   } catch (error) {
@@ -330,64 +369,81 @@ app.post('/api/spreadsheets/:id/row', async (req, res) => {
 
 // Add new column - with explicit spreadsheet ID validation
 app.post('/api/spreadsheets/:id/column', async (req, res) => {
-    try {
-      const { id } = req.params;
-      const { name, defaultValue = null, type = 'text', options = [] } = req.body;
-      
-      // Ensure we're working with a valid ObjectId
-      if (!mongoose.Types.ObjectId.isValid(id)) {
-        return res.status(400).json({ error: 'Invalid spreadsheet ID format' });
-      }
-      
-      // Explicitly fetch by the exact ID to prevent any issues
-      const spreadsheet = await Spreadsheet.findOne({ _id: id });
-      
-      if (!spreadsheet) {
-        return res.status(404).json({ error: 'Spreadsheet not found', id });
-      }
-      
-      // Check for duplicate column name
-      if (spreadsheet.columns.some(col => col.name === name)) {
-        return res.status(400).json({ error: 'Column name already exists' });
-      }
-      
-      // Create column object based on type
-      const columnObject = {
-        name,
-        locked: false,
-        type
-      };
-      
-      // Add options if it's a dropdown
-      if (type === 'dropdown' && Array.isArray(options) && options.length > 0) {
-        columnObject.options = options;
-      }
-      
-      // Add the new column to schema
-      spreadsheet.columns.push(columnObject);
-      
-      // Add the new field to all existing data rows
-      spreadsheet.data.forEach(row => {
-        row[name] = defaultValue;
-      });
-      
-      // Mark both columns and data as modified since we've updated both
-      spreadsheet.markModified('columns');
-      spreadsheet.markModified('data');
-      
-      spreadsheet.updatedAt = new Date();
-      await spreadsheet.save();
-      
-      res.json({ 
-        success: true, 
-        spreadsheetId: spreadsheet._id,
-        column: columnObject
-      });
-    } catch (error) {
-      console.error('Error adding column:', error);
-      res.status(500).json({ error: 'Error adding column', details: error.message });
+  try {
+    const { id } = req.params;
+    const { name, defaultValue = null, type = 'text', options = [] } = req.body;
+    
+    // Ensure we're working with a valid ObjectId
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ error: 'Invalid spreadsheet ID format' });
     }
-  });
+    
+    // Fetch the spreadsheet to check for duplicate column name
+    const existingSpreadsheet = await Spreadsheet.findById(id);
+    
+    if (!existingSpreadsheet) {
+      return res.status(404).json({ error: 'Spreadsheet not found', id });
+    }
+    
+    // Check for duplicate column name
+    if (existingSpreadsheet.columns.some(col => col.name === name)) {
+      return res.status(400).json({ error: 'Column name already exists' });
+    }
+    
+    // Create column object based on type
+    const columnObject = {
+      name,
+      locked: false,
+      type
+    };
+    
+    // Add options if it's a dropdown
+    if (type === 'dropdown' && Array.isArray(options) && options.length > 0) {
+      columnObject.options = options;
+    }
+    
+    // Use atomic updates to add the column and set default values
+    const updateOperations = await retryOperation(async () => {
+      // Add the column to the schema
+      await Spreadsheet.findByIdAndUpdate(
+        id,
+        { 
+          $push: { columns: columnObject },
+          $set: { updatedAt: new Date() }
+        }
+      );
+      
+      // Add default value to all rows atomically
+      // This avoids the VersionError by updating directly in database
+      const dataUpdates = existingSpreadsheet.data.map((_, index) => {
+        return {
+          updateOne: {
+            filter: { _id: id },
+            update: { $set: { [`data.${index}.${name}`]: defaultValue } }
+          }
+        };
+      });
+      
+      if (dataUpdates.length > 0) {
+        return await Spreadsheet.bulkWrite(dataUpdates);
+      }
+      return null;
+    }, 3);
+    
+    // Get the updated spreadsheet
+    const updatedSpreadsheet = await Spreadsheet.findById(id);
+    const addedColumn = updatedSpreadsheet.columns.find(col => col.name === name);
+    
+    res.json({ 
+      success: true, 
+      spreadsheetId: updatedSpreadsheet._id,
+      column: addedColumn
+    });
+  } catch (error) {
+    console.error('Error adding column:', error);
+    res.status(500).json({ error: 'Error adding column', details: error.message });
+  }
+});
 
 // Delete a spreadsheet
 app.delete('/api/spreadsheets/:id', async (req, res) => {
