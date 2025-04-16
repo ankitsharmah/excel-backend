@@ -100,7 +100,49 @@ io.on('connection', (socket) => {
     socket.join(spreadsheetId);
     console.log(`Client ${socket.id} joined spreadsheet: ${spreadsheetId}`);
   });
+  socket.on("cellUpdate", ({ spreadsheetId, updatedCell }) => {
+    socket.to(spreadsheetId).emit("cellUpdated", updatedCell);
+  });
+
+// Cell editing start
+socket.on("cellEditing", (data) => {
+  console.log(`Client ${socket.id} emitted cellEditing:`, data);
   
+  // Destructure with defaults to prevent errors
+  const { spreadsheetId, cell = {}, user = {} } = data;
+  
+  if (!spreadsheetId) {
+    console.error('Missing spreadsheetId in cellEditing event');
+    return;
+  }
+  
+  // console.log(`Broadcasting cellEditing to room ${spreadsheetId}`);
+  socket.to(spreadsheetId).emit("cellEditing", {
+    cell,
+    user,
+    timestamp: new Date(),
+  });
+});
+
+// Cell editing stop - add detailed logging
+socket.on("cellEditingStopped", (data) => {
+  console.log(`Client ${socket.id} emitted cellEditingStopped:`, data);
+  
+  // Destructure with defaults to prevent errors
+  const { spreadsheetId, cell = {}, user = {} } = data;
+  
+  if (!spreadsheetId) {
+    console.error('Missing spreadsheetId in cellEditingStopped event');
+    return;
+  }
+  
+  console.log(`Broadcasting cellEditingStopped to room ${spreadsheetId}`);
+  socket.to(spreadsheetId).emit("cellEditingStopped", {
+    cell,
+    user,
+  });
+});
+
   // Handle disconnection
   socket.on('disconnect', () => {
     console.log(`Client disconnected: ${socket.id}`);
@@ -320,6 +362,12 @@ app.put('/api/spreadsheets/:id/data', async (req, res) => {
       updates,
       timestamp: new Date()
     });
+      // onBlur={() => {
+    //     io.to(id).emit('cellEditingStopped', {
+    //   spreadsheetId: id,
+    //   cell: { rowIndex, columnKey: field }
+    // });
+  
 
     res.json({ success: true, spreadsheet: updatedSpreadsheet });
   } catch (error) {
