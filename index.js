@@ -6,9 +6,23 @@ const XLSX = require('xlsx');
 const papa = require('papaparse');
 const path = require('path');
 const fs = require('fs');
+const http = require('http'); // Required for Socket.io
+const socketIo = require('socket.io'); // Add Socket.io
 
 const app = express();
 const PORT = process.env.PORT || 9000;
+
+// Create an HTTP server using Express app
+const server = http.createServer(app);
+
+// Initialize Socket.io with CORS settings
+const io = socketIo(server, {
+  cors: {
+    origin: "*", // Allow all origins
+    methods: ["GET", "POST", "PUT", "DELETE"],
+    allowedHeaders: ["Content-Type"]
+  }
+});
 
 // Middleware
 app.use(cors("*"));
@@ -76,6 +90,22 @@ async function retryOperation(operation, maxRetries = 3) {
     }
   }
 }
+
+// Socket.io connection handler
+io.on('connection', (socket) => {
+  console.log(`Client connected: ${socket.id}`);
+  
+  // Listen for room joining (based on spreadsheet ID)
+  socket.on('joinSpreadsheet', (spreadsheetId) => {
+    socket.join(spreadsheetId);
+    console.log(`Client ${socket.id} joined spreadsheet: ${spreadsheetId}`);
+  });
+  
+  // Handle disconnection
+  socket.on('disconnect', () => {
+    console.log(`Client disconnected: ${socket.id}`);
+  });
+});
 
 // Routes
 app.get('/api/spreadsheets/:id/download', async (req, res) => {
@@ -239,7 +269,7 @@ app.get('/api/spreadsheets/:id', async (req, res) => {
   }
 });
 
-// Update cell data (batch update) - FIXED VERSION
+// Update cell data (batch update) - FIXED VERSION with Socket.io notifications
 app.put('/api/spreadsheets/:id/data', async (req, res) => {
   try {
     const { id } = req.params;
@@ -285,6 +315,12 @@ app.put('/api/spreadsheets/:id/data', async (req, res) => {
     // Get the updated document
     const updatedSpreadsheet = await Spreadsheet.findById(id);
     
+    // Emit socket event to all clients viewing this spreadsheet
+    io.to(id).emit('cellUpdates', {
+      updates,
+      timestamp: new Date()
+    });
+
     res.json({ success: true, spreadsheet: updatedSpreadsheet });
   } catch (error) {
     console.error('Error updating data:', error);
@@ -302,7 +338,7 @@ app.put('/api/spreadsheets/:id/data', async (req, res) => {
   }
 });
   
-// Lock/Unlock column
+// Lock/Unlock column with Socket.io notification
 app.put('/api/spreadsheets/:id/columns/:columnName/lock', async (req, res) => {
   try {
     const { id, columnName } = req.params;
@@ -329,6 +365,13 @@ app.put('/api/spreadsheets/:id/columns/:columnName/lock', async (req, res) => {
     
     const updatedColumn = result.columns.find(col => col.name === columnName);
     
+    // Emit socket event for column lock change
+    io.to(id).emit('columnLockChanged', {
+      columnName,
+      locked,
+      timestamp: new Date()
+    });
+    
     res.json({ success: true, column: updatedColumn });
   } catch (error) {
     console.error('Error updating column lock status:', error);
@@ -336,7 +379,7 @@ app.put('/api/spreadsheets/:id/columns/:columnName/lock', async (req, res) => {
   }
 });
 
-// Add new row
+// Add new row with Socket.io notification
 app.post('/api/spreadsheets/:id/row', async (req, res) => {
   try {
     const { id } = req.params;
@@ -356,9 +399,18 @@ app.post('/api/spreadsheets/:id/row', async (req, res) => {
       return res.status(404).json({ error: 'Spreadsheet not found' });
     }
     
+    const newRowIndex = result.data.length - 1;
+    
+    // Emit socket event for new row
+    io.to(id).emit('rowAdded', {
+      rowIndex: newRowIndex,
+      rowData,
+      timestamp: new Date()
+    });
+    
     res.json({ 
       success: true, 
-      rowIndex: result.data.length - 1,
+      rowIndex: newRowIndex,
       row: rowData
     });
   } catch (error) {
@@ -367,75 +419,74 @@ app.post('/api/spreadsheets/:id/row', async (req, res) => {
   }
 });
 
-// Add new column - with explicit spreadsheet ID validation
+// Add new column with Socket.io notification
 app.post('/api/spreadsheets/:id/column', async (req, res) => {
+  console.log("im called");
   try {
     const { id } = req.params;
     const { name, defaultValue = null, type = 'text', options = [] } = req.body;
-    
-    // Ensure we're working with a valid ObjectId
+    console.log("object");
+
     if (!mongoose.Types.ObjectId.isValid(id)) {
       return res.status(400).json({ error: 'Invalid spreadsheet ID format' });
     }
-    
-    // Fetch the spreadsheet to check for duplicate column name
+
     const existingSpreadsheet = await Spreadsheet.findById(id);
-    
+
     if (!existingSpreadsheet) {
       return res.status(404).json({ error: 'Spreadsheet not found', id });
     }
-    
-    // Check for duplicate column name
+
     if (existingSpreadsheet.columns.some(col => col.name === name)) {
       return res.status(400).json({ error: 'Column name already exists' });
     }
-    
-    // Create column object based on type
+
     const columnObject = {
       name,
       locked: false,
       type
     };
-    
-    // Add options if it's a dropdown
+
     if (type === 'dropdown' && Array.isArray(options) && options.length > 0) {
       columnObject.options = options;
     }
-    
-    // Use atomic updates to add the column and set default values
-    const updateOperations = await retryOperation(async () => {
-      // Add the column to the schema
-      await Spreadsheet.findByIdAndUpdate(
-        id,
-        { 
-          $push: { columns: columnObject },
-          $set: { updatedAt: new Date() }
-        }
-      );
-      
-      // Add default value to all rows atomically
-      // This avoids the VersionError by updating directly in database
-      const dataUpdates = existingSpreadsheet.data.map((_, index) => {
-        return {
-          updateOne: {
-            filter: { _id: id },
-            update: { $set: { [`data.${index}.${name}`]: defaultValue } }
-          }
-        };
-      });
-      
-      if (dataUpdates.length > 0) {
-        return await Spreadsheet.bulkWrite(dataUpdates);
+
+    // Push the new column first
+    await Spreadsheet.findByIdAndUpdate(
+      id,
+      {
+        $push: { columns: columnObject },
+        $set: { updatedAt: new Date() }
       }
-      return null;
-    }, 3);
-    
-    // Get the updated spreadsheet
+    );
+    console.log("column added");
+
+    // Re-fetch spreadsheet to get current row count
+    const freshSpreadsheet = await Spreadsheet.findById(id);
+
+    // Build a single $set operation to update all rows
+    const defaultUpdates = {};
+    freshSpreadsheet.data.forEach((_, index) => {
+      defaultUpdates[`data.${index}.${name}`] = defaultValue;
+    });
+
+    await Spreadsheet.updateOne(
+      { _id: id },
+      { $set: defaultUpdates }
+    );
+    console.log("default values set");
+
     const updatedSpreadsheet = await Spreadsheet.findById(id);
     const addedColumn = updatedSpreadsheet.columns.find(col => col.name === name);
-    
-    res.json({ 
-      success: true, 
+
+    io.to(id).emit('columnAdded', {
+      column: addedColumn,
+      defaultValue,
+      timestamp: new Date()
+    });
+
+    res.status(200).json({
+      success: true,
       spreadsheetId: updatedSpreadsheet._id,
       column: addedColumn
     });
@@ -444,6 +495,7 @@ app.post('/api/spreadsheets/:id/column', async (req, res) => {
     res.status(500).json({ error: 'Error adding column', details: error.message });
   }
 });
+
 
 // Delete a spreadsheet
 app.delete('/api/spreadsheets/:id', async (req, res) => {
@@ -456,6 +508,8 @@ app.delete('/api/spreadsheets/:id', async (req, res) => {
       return res.status(404).json({ error: 'Spreadsheet not found' });
     }
     
+    // No need to emit an event here as clients won't be viewing this spreadsheet anymore
+    
     res.json({ success: true });
   } catch (error) {
     console.error('Error deleting spreadsheet:', error);
@@ -463,9 +517,9 @@ app.delete('/api/spreadsheets/:id', async (req, res) => {
   }
 });
 
-// Start the server
-app.listen(PORT, () => {
+// Start the server using http server instead of Express app
+server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
 
-module.exports = app;
+module.exports = { app, server, io }; 
