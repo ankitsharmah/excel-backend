@@ -116,7 +116,7 @@ socket.on("cellEditing", (data) => {
     return;
   }
   
-  // console.log(`Broadcasting cellEditing to room ${spreadsheetId}`);
+  console.log(`Broadcasting cellEditing to room ${spreadsheetId}`);
   socket.to(spreadsheetId).emit("cellEditing", {
     cell,
     user,
@@ -362,12 +362,6 @@ app.put('/api/spreadsheets/:id/data', async (req, res) => {
       updates,
       timestamp: new Date()
     });
-      // onBlur={() => {
-    //     io.to(id).emit('cellEditingStopped', {
-    //   spreadsheetId: id,
-    //   cell: { rowIndex, columnKey: field }
-    // });
-  
 
     res.json({ success: true, spreadsheet: updatedSpreadsheet });
   } catch (error) {
@@ -428,7 +422,7 @@ app.put('/api/spreadsheets/:id/columns/:columnName/lock', async (req, res) => {
 });
 
 // Add new row with Socket.io notification
-app.post('/api/spreadsheets/:id/row', async (req, res) => {
+app.post('/api/spreadsheets/:id/rows', async (req, res) => {
   try {
     const { id } = req.params;
     const rowData = req.body;
@@ -468,11 +462,11 @@ app.post('/api/spreadsheets/:id/row', async (req, res) => {
 });
 
 // Add new column with Socket.io notification
-app.post('/api/spreadsheets/:id/column', async (req, res) => {
+app.post('/api/spreadsheets/:id/columns', async (req, res) => {
   console.log("im called");
   try {
     const { id } = req.params;
-    const { name, defaultValue = null, type = 'text', options = [] } = req.body;
+    const { name, defaultValue = null, type = 'text', options = [] } = req.body.column;
     console.log("object");
 
     if (!mongoose.Types.ObjectId.isValid(id)) {
@@ -486,6 +480,7 @@ app.post('/api/spreadsheets/:id/column', async (req, res) => {
     }
 
     if (existingSpreadsheet.columns.some(col => col.name === name)) {
+      // console.log(col.name)
       return res.status(400).json({ error: 'Column name already exists' });
     }
 
@@ -544,6 +539,189 @@ app.post('/api/spreadsheets/:id/column', async (req, res) => {
   }
 });
 
+// OPTIMIZED AND FIXED: Edit column name with Socket.io notification
+app.put('/api/spreadsheets/:id/columns/:columnName', async (req, res) => {
+  try {
+    const { id, columnName } = req.params;
+    const { newName } = req.body;
+    
+    // Get spreadsheet without using positional operator
+    const spreadsheet = await Spreadsheet.findById(id);
+    
+    if (!spreadsheet) {
+      return res.status(404).json({ error: 'Spreadsheet not found' });
+    }
+    
+    // Find the column
+    const column = spreadsheet.columns.find(col => col.name === columnName);
+    if (!column) {
+      return res.status(404).json({ error: 'Column not found' });
+    }
+    
+    // Check if column is locked
+    if (column.locked) {
+      return res.status(403).json({ 
+        error: 'Cannot edit locked column',
+        column: columnName
+      });
+    }
+    
+    // Check if new name already exists in other columns
+    if (spreadsheet.columns.some(col => col.name === newName && col.name !== columnName)) {
+      return res.status(400).json({ error: 'Column name already exists' });
+    }
+    
+    // Update column in a single operation using MongoDB's aggregation pipeline updates
+    const result = await Spreadsheet.findByIdAndUpdate(
+      id,
+      [
+        { $set: { 
+            columns: {
+              $map: {
+                input: "$columns",
+                as: "col",
+                in: {
+                  $cond: [
+                    { $eq: ["$$col.name", columnName] },
+                    { $mergeObjects: ["$$col", { name: newName }] },
+                    "$$col"
+                  ]
+                }
+              }
+            },
+            // Update all data entries using array manipulation in a single operation
+            data: {
+              $map: {
+                input: "$data",
+                as: "row",
+                in: {
+                  $mergeObjects: [
+                    // Remove old field
+                    { $arrayToObject: {
+                        $filter: {
+                          input: { $objectToArray: "$$row" },
+                          as: "field",
+                          cond: { $ne: ["$$field.k", columnName] }
+                        }
+                      }
+                    },
+                    // Add new field with old value
+                    { $cond: [
+                        { $ifNull: [{ $getField: { field: columnName, input: "$$row" } }, false] },
+                        { [newName]: { $getField: { field: columnName, input: "$$row" } } },
+                        {}
+                      ]
+                    }
+                  ]
+                }
+              }
+            },
+            updatedAt: new Date()
+          }
+        }
+      ],
+      { new: true }
+    );
+    
+    // Find the updated column details
+    const updatedColumn = result.columns.find(col => col.name === newName);
+    
+    // Emit socket event for column rename
+    io.to(id).emit('columnRenamed', {
+      oldName: columnName,
+      newName: newName,
+      column: updatedColumn,
+      timestamp: new Date()
+    });
+    
+    res.json({ 
+      success: true, 
+      oldName: columnName,
+      newName: newName,
+      column: updatedColumn
+    });
+  } catch (error) {
+    console.error('Error editing column name:', error);
+    res.status(500).json({ error: 'Error editing column name', details: error.message });
+  }
+});
+
+// OPTIMIZED AND FIXED: Delete column with Socket.io notification
+app.delete('/api/spreadsheets/:id/columns/:columnName', async (req, res) => {
+  try {
+    const { id, columnName } = req.params;
+    
+    // Get spreadsheet without using positional operator
+    const spreadsheet = await Spreadsheet.findById(id);
+    
+    if (!spreadsheet) {
+      return res.status(404).json({ error: 'Spreadsheet not found' });
+    }
+    
+    // Find the column
+    const column = spreadsheet.columns.find(col => col.name === columnName);
+    if (!column) {
+      return res.status(404).json({ error: 'Column not found' });
+    }
+    
+    // Check if column is locked
+    if (column.locked) {
+      return res.status(403).json({ 
+        error: 'Cannot delete locked column',
+        column: columnName
+      });
+    }
+    
+    // Remove column and its data in a single operation
+    await Spreadsheet.findByIdAndUpdate(
+      id,
+      [
+        { $set: {
+            // Remove column from schema
+            columns: {
+              $filter: {
+                input: "$columns",
+                as: "col",
+                cond: { $ne: ["$$col.name", columnName] }
+              }
+            },
+            // Remove column from all data rows in one operation
+            data: {
+              $map: {
+                input: "$data",
+                as: "row",
+                in: {
+                  $arrayToObject: {
+                    $filter: {
+                      input: { $objectToArray: "$$row" },
+                      as: "field",
+                      cond: { $ne: ["$$field.k", columnName] }
+                    }
+                  }
+                }
+              }
+            },
+            updatedAt: new Date()
+          }
+        }
+      ]
+    );
+    
+    // Emit socket event for column deletion
+    io.to(id).emit('columnDeleted', {
+      columnName,
+      timestamp: new Date()
+    });
+    
+    res.json({ 
+      success: true, 
+      message: `Column "${columnName}" deleted successfully` 
+    });
+  } catch (error) {
+    console.error('Error deleting column:', error);
+    res.status(500).json({ error: 'Error deleting column', details: error.message });
+  }
+});
 
 // Delete a spreadsheet
 app.delete('/api/spreadsheets/:id', async (req, res) => {
@@ -570,4 +748,4 @@ server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
 
-module.exports = { app, server, io }; 
+module.exports = { app, server, io };
